@@ -249,23 +249,24 @@ def choose_items(items, raw):
             found = items[a - 1:b]
         else:
             low = token.lower()
-            found = ([i for i in items if i["title"].lower() == low] or [i for i in items if (i.get("group") or "").lower() == low]
-                     or [i for i in items if low in i["title"].lower()])
+            found = ([i for i in items if i["title"].lower() == low] or [i for i in items if i.get("text", "").lower() == low]
+                     or [i for i in items if (i.get("group") or "").lower() == low] or [i for i in items if low in i["title"].lower()])
             if not found:
                 raise ValueError(f"Menu '{token}' tidak ditemukan.")
         picked += [i for i in found if i not in picked]
     return [i for i in items if i in picked]
 
 
-def generic_content(args, tpl_defaults, app, items, url, user):
+def generic_content(args, tpl_defaults, app, items, url, user, crud_titles=()):
     """Isi dokumen untuk mode generik. Isi bawaan (tujuan, kriteria, tanda tangan, proyek) hanya diambil dari dokumen contoh
-    yang diberikan user, bukan dari template bawaan."""
+    yang diberikan user, bukan dari template bawaan. crud_titles: menu yang ikut diuji CRUD (ditandai di ruang lingkup)."""
     info_t = tpl_defaults.get("info", {})
     today = datetime.date.today()
     menus = [i for i in items if i["kind"] == "menu"]
     groups = {}
     for m in menus:
-        groups.setdefault(m.get("group") or m["text"], []).append(m["text"] if m.get("group") else None)
+        name = m["text"] + (" (CRUD)" if m["title"] in crud_titles else "")
+        groups.setdefault(m.get("group") or name, []).append(name if m.get("group") else None)
     tops = list(groups)
     intro = [f"Dokumen User Acceptance Test (UAT) ini digunakan sebagai acuan pengujian aplikasi {app} oleh pengguna akhir untuk "
              "memastikan bahwa fungsi aplikasi telah berjalan sesuai kebutuhan bisnis sebelum go-live."]
@@ -372,7 +373,7 @@ def prepare_pack(args, pack, browser, password, builder, interactive):
         tcs = runner.smoke_tcs(mod) if mod.get("type") == "smoke" else mod.get("testcases", [])
         groups.append((mod.get("title", m), [(d["scenario"], tc_fn(d, m)) for d in tcs]))
     extra = {"modules": modules, "lang": args.lang, "allow_write": args.allow_write}
-    return content, groups, (out_docx, shots_dir, out_json), extra, pack.cfg.get("id_prefix")
+    return lambda results: (content, extra), groups, (out_docx, shots_dir, out_json), pack.cfg.get("id_prefix")
 
 
 def prepare_generic(args, browser, password, template, builder, interactive):
@@ -417,10 +418,14 @@ def prepare_generic(args, browser, password, template, builder, interactive):
             chosen = choose_items(items, args.modules)
         except ValueError as e:
             raise SystemExit(str(e))
+    if interactive and not args.crud and any(i["kind"] == "menu" for i in chosen):
+        args.crud = ask_yes("Uji CRUD juga? Di menu yang punya tombol Tambah/Add, script akan MENAMBAH data uji berpenanda 'UAT…', "
+                            "melihat, MENGUBAH, lalu MENGHAPUS data uji itu lagi (data lain tidak disentuh)", default=True)
+    ex.crud = args.crud
     ask_output(args, interactive)
     tpl_defaults = builder.tpl.defaults if os.path.abspath(template) != os.path.abspath(DEFAULT_TEMPLATE) else {}
-    content = generic_content(args, tpl_defaults, ex.app, chosen, args.url, args.user)
-    out_docx, shots_dir, out_json = output_paths(args.output, content["title"])
+    title = args.title or f"UAT {ex.app}"
+    out_docx, shots_dir, out_json = output_paths(args.output, title)
     os.makedirs(shots_dir, exist_ok=True)
     ex.shots = shots_dir
     menu_json = os.path.splitext(out_docx)[0] + "_menu.json"
@@ -430,12 +435,19 @@ def prepare_generic(args, browser, password, template, builder, interactive):
                   f, ensure_ascii=False, indent=1)
     print(f"Daftar menu disimpan: {menu_json}")
 
-    def tc_fn(s, fn, it):
-        return lambda tc_id: {**ex.run(tc_id, s, fn), "module": it["title"]}
-    groups = [(it["title"], [(s, tc_fn(s, fn, it)) for s, fn in ex.plan(it)]) for it in chosen]
-    print(f"\nUAT {ex.app} · {args.url} · {len(chosen)} modul · {sum(len(g[1]) for g in groups)} test case")
-    extra = {"app": ex.app, "home": ex.home, "modules": [it["title"] for it in chosen]}
-    return content, groups, (out_docx, shots_dir, out_json), extra, None
+    def tcs(it):  # dibaca bertahap: test case CRUD baru diketahui setelah halaman menu dibuka
+        for s, fn in ex.plan(it):
+            yield s, lambda tc_id, s=s, fn=fn: {**ex.run(tc_id, s, fn), "module": it["title"]}
+    groups = [(it["title"], tcs(it)) for it in chosen]
+    print(f"\nUAT {ex.app} · {args.url} · {len(chosen)} modul · CRUD {'aktif' if ex.crud else 'tidak'}")
+
+    def finish(results):
+        crud = {r["module"] for r in results if r.get("crud")}
+        content = generic_content(args, tpl_defaults, ex.app, chosen, args.url, args.user, crud)
+        left = [{"menu": next((m["title"] for m in menus if m["url"] == u), u), "data": mk} for u, mk in ex.leftovers()]
+        return content, {"app": ex.app, "home": ex.home, "modules": [it["title"] for it in chosen], "crud": ex.crud,
+                         "data_uji_tersisa": left}
+    return finish, groups, (out_docx, shots_dir, out_json), None
 
 
 def main():
@@ -447,6 +459,8 @@ def main():
     ap.add_argument("--password", help="Password login (kosongkan agar ditanyakan)")
     ap.add_argument("-m", "--modules", help="Menu yang di-UAT: nomor, rentang (2-10), nama menu/grup dipisah koma, atau 'all'")
     ap.add_argument("-o", "--output", help="Folder atau path .docx hasil")
+    ap.add_argument("--crud", action="store_true", help="Uji juga tambah/lihat/ubah/hapus data (CRUD) di menu yang punya tombol Tambah; "
+                    "data uji berpenanda UAT… dihapus lagi di akhir")
     ap.add_argument("--menu-file", help="Pakai daftar menu dari file *_menu.json hasil sebelumnya (bisa diedit) daripada membaca ulang")
     ap.add_argument("--id-prefix", help="Awalan Test Case ID (bawaan UAT → UAT-001)")
     ap.add_argument("-p", "--pack", help="Opsional: jalankan skenario dari paket di packs\\ (mis. portal-tenant) alih-alih menu otomatis")
@@ -513,9 +527,9 @@ def main():
     try:
         try:
             if pack:
-                content, groups, paths, extra, prefix = prepare_pack(args, pack, browser, password, builder, interactive)
+                finish, groups, paths, prefix = prepare_pack(args, pack, browser, password, builder, interactive)
             else:
-                content, groups, paths, extra, prefix = prepare_generic(args, browser, password, template, builder, interactive)
+                finish, groups, paths, prefix = prepare_generic(args, browser, password, template, builder, interactive)
         except BrowserError as e:
             raise SystemExit(f"Browser error: {e}")
         out_docx, shots_dir, out_json = paths
@@ -525,6 +539,7 @@ def main():
     finally:
         browser.close()
 
+    content, extra = finish(results)
     with open(out_json, "w", encoding="utf8") as f:
         json.dump({"url": args.url, "user": args.user, **extra,
                    "results": [{**r, "images": [list(i) for i in r["images"]]} for r in results]}, f, ensure_ascii=False, indent=1)
@@ -537,6 +552,10 @@ def main():
     print(f"Dokumen   : {out_docx}\nScreenshot: {shots_dir}\nHasil JSON: {out_json}")
     if builder.missing:
         print("Screenshot tidak ditemukan: " + ", ".join(builder.missing))
+    if extra.get("data_uji_tersisa"):
+        print("\nPERHATIAN: data uji berikut mungkin masih ada di aplikasi, periksa dan hapus manual:")
+        for d in extra["data_uji_tersisa"]:
+            print(f"  - menu {d['menu']}: {d['data']}")
     return 0
 
 

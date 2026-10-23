@@ -227,6 +227,12 @@ class Browser:
         self.settle(timeout=timeout)
         return self.last_doc_status
 
+    def reload(self, timeout=90):
+        self.last_doc_status = None
+        self.send("Page.reload", {"ignoreCache": True}, timeout=timeout)
+        self.settle(timeout=timeout)
+        return self.last_doc_status
+
     def eval(self, expression, timeout=60):
         res = self.send("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True,
                                              "userGesture": True}, timeout=timeout)

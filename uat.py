@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """UAT otomatis aplikasi web → dokumen UAT (.docx) mengikuti format dokumen contoh.
 
+Berlaku untuk aplikasi web apa pun: script login sendiri, membaca menu-menu aplikasi setelah login (disimpan ke
+*_menu.json), lalu menu yang dipilih menjadi modul UAT (tiap menu dibuka, diperiksa, dan di-screenshot).
+
 Contoh:
   py uat.py            (tanpa argumen: dokumen contoh, URL, user, password, modul, dan folder simpan ditanyakan satu per satu)
-  py uat.py --template "D:\\UAT\\UAT_Portal_Tenant.docx" --url https://lymanportal.vcloudproperty.com ^
-            --user qa.tenant.lyman@yabes.co --modules login,home,request --output "D:\\UAT\\Hasil"
-  py uat.py --list-modules
+  py uat.py --template "D:\\UAT\\Contoh_UAT.docx" --url https://erp.perusahaan.co.id --user qa@perusahaan.co.id ^
+            --modules all --output "D:\\UAT\\Hasil"
 Password tidak perlu ditulis di perintah: bila --password kosong akan ditanyakan (tidak tampil di layar).
 """
 import argparse
@@ -22,6 +24,7 @@ sys.path.insert(0, HERE)
 
 from uat_engine.browser import Browser, BrowserError  # noqa: E402
 from uat_engine.docbuilder import DocBuilder  # noqa: E402
+from uat_engine.explorer import Explorer, LoginError, menu_title  # noqa: E402
 from uat_engine.runner import Pack, Runner  # noqa: E402
 
 PACKS_DIR = os.path.join(HERE, "packs")
@@ -221,77 +224,119 @@ def build_content(args, pack, tpl_defaults, modules, url, user):
     }
 
 
-def main():
-    ap = argparse.ArgumentParser(description="UAT otomatis aplikasi web → dokumen UAT (.docx)",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("-t", "--template", help="Dokumen contoh (.docx) yang formatnya diikuti. PDF/kosong = template bawaan.")
-    ap.add_argument("-u", "--url", help="URL aplikasi web, contoh https://lymanportal.vcloudproperty.com")
-    ap.add_argument("--user", help="User/email login utama")
-    ap.add_argument("--password", help="Password login utama (kosongkan agar ditanyakan)")
-    ap.add_argument("-m", "--modules", help="Modul yang di-UAT, pisahkan koma (nama atau nomor), atau 'all'")
-    ap.add_argument("-o", "--output", help="Folder atau path .docx hasil")
-    ap.add_argument("-p", "--pack", help="Paket skenario (folder di packs\\)")
-    ap.add_argument("--lang", choices=["en", "id"], help="Bahasa tampilan aplikasi saat screenshot (bawaan paket)")
-    ap.add_argument("--allow-write", action="store_true", help="Jalankan juga skenario yang mengirim/menyimpan data")
-    ap.add_argument("--account", action="append", metavar="NAMA=USER:PASSWORD", help="Akun tambahan, mis. tenantB=amri@yabes.co:xxx atau tr=qa.tr@yabes.co")
-    ap.add_argument("--param", action="append", metavar="KUNCI=NILAI", help="Parameter skenario (lihat pack.json → params)")
-    ap.add_argument("--title", help="Judul dokumen (footer & properti dokumen)")
-    ap.add_argument("--project", help="Isi 'Nama Proyek'")
-    ap.add_argument("--client", help="Nama perusahaan klien pada tabel tanda tangan")
-    ap.add_argument("--module-title", help="Isi 'Modul' pada Informasi Umum")
-    ap.add_argument("--author", help="Isi 'Disusun Oleh'")
-    ap.add_argument("--reviewer", help="Isi 'Ditinjau Oleh'")
-    ap.add_argument("--doc-version", help="Isi 'Versi Dokumen'")
-    ap.add_argument("--no-run-note", action="store_true", help="Jangan tambahkan kalimat waktu/URL eksekusi di paragraf pembuka")
-    ap.add_argument("--headed", action="store_true", help="Tampilkan jendela browser (bukan headless)")
-    ap.add_argument("--browser", help="Path msedge.exe / chrome.exe")
-    ap.add_argument("--list-modules", action="store_true", help="Tampilkan daftar modul paket lalu keluar")
-    ap.add_argument("--list-packs", action="store_true", help="Tampilkan daftar paket lalu keluar")
-    ap.add_argument("--no-interactive", action="store_true", help="Jangan bertanya; isian wajib harus lewat argumen")
-    args = ap.parse_args()
-    sys.stdout.reconfigure(encoding="utf-8")
+def print_items(items, rel):
+    print("\nModul = menu yang terbaca setelah login:")
+    w = min(45, max(len(it["title"]) for it in items))
+    for k, it in enumerate(items, 1):
+        print(f"  {k:>3}. {it['title']:<{w}}  {it.get('note') or rel(it['url'])}")
 
-    packs = list_packs()
-    if args.list_packs:
-        for p in packs:
-            with open(os.path.join(PACKS_DIR, p, "pack.json"), encoding="utf8") as f:
-                print(f"  {p:<16} {json.load(f).get('title', '')}")
-        return 0
-    interactive = not args.no_interactive and sys.stdin.isatty()
 
-    if not args.pack:
-        if interactive and len(packs) > 1:
-            print("Paket skenario: " + ", ".join(f"{i}. {p}" for i, p in enumerate(packs, 1)))
-            choice = ask("Pilih paket", packs[0])
-            args.pack = packs[int(choice) - 1] if choice.isdigit() else choice
+def choose_items(items, raw):
+    """Pilih modul: nomor (3), rentang (2-10), nama menu, nama grup menu, atau all."""
+    if not raw or raw.strip().lower() in ("all", "semua", "*"):
+        return items
+    tokens = []
+    for part in raw.split(","):
+        part = part.strip()
+        tokens += part.split() if re.fullmatch(r"\d+(\s+\d+)+", part) else [part] if part else []
+    picked = []
+    for token in tokens:
+        rng = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+        if rng or token.isdigit():
+            a, b = (int(rng.group(1)), int(rng.group(2))) if rng else (int(token), int(token))
+            if not 1 <= a <= b <= len(items):
+                raise ValueError(f"Nomor {token} di luar 1-{len(items)}.")
+            found = items[a - 1:b]
         else:
-            args.pack = packs[0]
-    pack = Pack(os.path.join(PACKS_DIR, args.pack))
-    if args.list_modules:
-        print_modules(pack)
-        return 0
+            low = token.lower()
+            found = ([i for i in items if i["title"].lower() == low] or [i for i in items if (i.get("group") or "").lower() == low]
+                     or [i for i in items if low in i["title"].lower()])
+            if not found:
+                raise ValueError(f"Menu '{token}' tidak ditemukan.")
+        picked += [i for i in found if i not in picked]
+    return [i for i in items if i in picked]
 
+
+def generic_content(args, tpl_defaults, app, items, url, user):
+    """Isi dokumen untuk mode generik. Isi bawaan (tujuan, kriteria, tanda tangan, proyek) hanya diambil dari dokumen contoh
+    yang diberikan user, bukan dari template bawaan."""
+    info_t = tpl_defaults.get("info", {})
+    today = datetime.date.today()
+    menus = [i for i in items if i["kind"] == "menu"]
+    groups = {}
+    for m in menus:
+        groups.setdefault(m.get("group") or m["text"], []).append(m["text"] if m.get("group") else None)
+    tops = list(groups)
+    intro = [f"Dokumen User Acceptance Test (UAT) ini digunakan sebagai acuan pengujian aplikasi {app} oleh pengguna akhir untuk "
+             "memastikan bahwa fungsi aplikasi telah berjalan sesuai kebutuhan bisnis sebelum go-live."]
+    if not args.no_run_note:
+        intro.append(f"Pengujian dijalankan otomatis pada {tanggal_id(today)} di {url} menggunakan akun {user}; daftar menu yang "
+                     "diuji dibaca langsung dari aplikasi setelah login.")
+    lingkup = []
+    if any(i["kind"] == "login" for i in items):
+        lingkup.append("Login dengan akun valid dan akun yang salah")
+    for g, subs in groups.items():
+        subs = [x for x in subs if x]
+        lingkup.append(f"Menu {g}: {', '.join(subs)}" if subs else f"Menu {g}")
+    if any(i["kind"] == "logout" for i in items):
+        lingkup.append("Logout dan akses halaman setelah logout")
+    signers = tpl_defaults.get("signers") or [
+        {"company": "PT. Yabes Multipro Solusindo", "roles": ["Project Manager", "Consultant"]},
+        {"company": "[Nama Perusahaan Klien]", "roles": ["Project Manager", "Key User", "Key User", "Key User"]}]
+    if args.client:
+        signers = [s if i == 0 else {**s, "company": args.client} for i, s in enumerate(signers)]
+    return {
+        "title": args.title or f"UAT {app}",
+        "intro": intro,
+        "info": [
+            ("Nama Proyek", args.project or info_t.get("Nama Proyek") or "[Nama Proyek]"),
+            ("Modul", args.module_title or (f"{app} ({', '.join(tops[:10])}{', dll.' if len(tops) > 10 else ''})" if tops else app)),
+            ("Disusun Oleh", args.author or info_t.get("Disusun Oleh") or "[Nama Penyusun]"),
+            ("Ditinjau Oleh", args.reviewer or info_t.get("Ditinjau Oleh") or "[Project Manager / QA / Business Owner]"),
+            ("Tanggal", tanggal_id(today)),
+            ("Versi Dokumen", args.doc_version or info_t.get("Versi Dokumen") or "1.0"),
+        ],
+        "tujuan": tpl_defaults.get("tujuan") or [
+            "Tujuan dari UAT adalah memastikan bahwa sistem telah memenuhi kebutuhan proses bisnis pengguna, alur kerja berjalan "
+            "dengan benar, data tersimpan secara akurat, serta output sistem sesuai dengan aturan dan ekspektasi operasional perusahaan."],
+        "lingkup": lingkup,
+        "kriteria": tpl_defaults.get("kriteria") or [
+            "Seluruh skenario pengujian kritikal berhasil dijalankan",
+            "Tidak terdapat defect dengan kategori blocker atau critical",
+            "Data yang diinput, diproses, dan ditampilkan akurat",
+            "Pengguna memberikan persetujuan bahwa sistem siap digunakan"],
+        "signers": signers,
+    }
+
+
+def ask_output(args, interactive):
+    if interactive:
+        args.output = args.output or ask("Simpan dokumen di (folder atau path .docx)", os.path.join(os.path.expanduser("~"), "Documents", "UAT"))
+    if not args.output:
+        raise SystemExit("--output wajib diisi.")
+    args.output = clean_path(args.output)
+
+
+def run_all(groups, prefix):
+    """groups: [(judul modul, [(skenario, fungsi(tc_id) → hasil test case)])]."""
+    results, n = [], 0
     try:
-        browser = Browser(headless=not args.headed, browser_path=args.browser)  # cek browser sebelum mulai bertanya
+        for title, tcs in groups:
+            print(f"[{title}]")
+            for _, fn in tcs:
+                n += 1
+                tc = fn(f"{prefix}-{n:03d}")
+                results.append(tc)
+                print(f"  {tc['id']} {tc['status']:<8} {tc['scenario']}")
     except BrowserError as e:
-        raise SystemExit(str(e))
+        print(f"\nBrowser error: {e}")
+    except KeyboardInterrupt:
+        print("\nDihentikan oleh user; dokumen dibuat dari test case yang sudah selesai.")
+    return results
 
-    # Urutan isian: dokumen contoh → URL → user → password → modul → folder simpan
-    if interactive:
-        print("Isi data UAT (Enter = pakai nilai di dalam [ ]).")
-    template, builder = get_template(args.template, interactive)
-    if interactive:
-        args.url = args.url or ask("URL web", pack.cfg.get("default_url"))
-        args.user = args.user or ask("User")
-    args.url = normalize_url(args.url)
-    for name in ("url", "user"):
-        if not getattr(args, name):
-            raise SystemExit(f"--{name} wajib diisi.")
-    password = args.password or os.environ.get("UAT_PASSWORD")
-    while not password and sys.stdin.isatty():
-        password = getpass.getpass(f"Password {args.user} (tidak tampil di layar): ")
-    if not password:
-        raise SystemExit("--password wajib diisi (atau isi variabel lingkungan UAT_PASSWORD).")
+
+def prepare_pack(args, pack, browser, password, builder, interactive):
+    """Mode paket skenario (--pack): modul dari packs/<paket>/modules."""
     if interactive and not args.modules:
         print_modules(pack)
         while True:
@@ -305,57 +350,183 @@ def main():
             modules = choose_modules(pack, args.modules)
         except ValueError as e:
             raise SystemExit(str(e))
-    if interactive:
-        args.output = args.output or ask("Simpan dokumen di (folder atau path .docx)", os.path.join(os.path.expanduser("~"), "Documents", "UAT"))
-    if not args.output:
-        raise SystemExit("--output wajib diisi.")
-    args.output = clean_path(args.output)
+    ask_output(args, interactive)
     n_write = sum(1 for m in modules for tc in pack.modules[m].get("testcases", []) if tc.get("write"))
     if interactive and n_write and not args.allow_write:
         args.allow_write = ask_yes(f"{n_write} skenario akan mengirim/menyimpan data ke aplikasi (mis. membuat request, ganti password). "
                                    "Jalankan juga?")
-    lang = args.lang or pack.cfg.get("default_lang", "en")
-    args.lang = lang
-
+    args.lang = args.lang or pack.cfg.get("default_lang", "en")
     accounts = {"main": {"user": args.user, "password": password}}
     accounts.update(parse_accounts(args.account))
-    content = build_content(args, pack, builder.tpl.defaults, modules, args.url.rstrip("/"), args.user)
+    content = build_content(args, pack, builder.tpl.defaults, modules, args.url, args.user)
     out_docx, shots_dir, out_json = output_paths(args.output, content["title"])
-
-    print(f"\nUAT {pack.cfg.get('title', '')} · {args.url} · modul: {', '.join(modules)} · bahasa {lang.upper()}"
+    print(f"\nUAT {pack.cfg.get('title', '')} · {args.url} · modul: {', '.join(modules)} · bahasa {args.lang.upper()}"
           f" · {'mode tulis AKTIF' if args.allow_write else 'mode baca (tanpa kirim data)'}")
-    print(f"Format dokumen: {template}\n")
-    started = time.time()
+    runner = Runner(browser, pack, args.url, accounts, parse_kv(args.param), args.lang, args.allow_write, shots_dir)
+
+    def tc_fn(d, m):
+        return lambda tc_id: {**runner.run_tc(d, tc_id), "module": m}
+    groups = []
+    for m in modules:
+        mod = pack.modules[m]
+        tcs = runner.smoke_tcs(mod) if mod.get("type") == "smoke" else mod.get("testcases", [])
+        groups.append((mod.get("title", m), [(d["scenario"], tc_fn(d, m)) for d in tcs]))
+    extra = {"modules": modules, "lang": args.lang, "allow_write": args.allow_write}
+    return content, groups, (out_docx, shots_dir, out_json), extra, pack.cfg.get("id_prefix")
+
+
+def prepare_generic(args, browser, password, template, builder, interactive):
+    """Mode generik: login, baca menu aplikasi, menu menjadi modul UAT."""
+    ex = Explorer(browser, args.url, args.user, password)
+    while True:
+        print(f"\nLogin ke {args.url} sebagai {args.user} …")
+        try:
+            ex.login()
+            break
+        except LoginError as e:
+            print(f"  {e}")
+            if not interactive:
+                raise SystemExit(1)
+            args.user = ask("User", args.user)
+            ex.user, ex.password = args.user, ""
+            while not ex.password:
+                ex.password = getpass.getpass(f"Password {args.user} (tidak tampil di layar): ")
+    print(f"Login berhasil → {ex.rel(ex.home)}")
+    if args.menu_file:
+        with open(clean_path(args.menu_file), encoding="utf8") as f:
+            menus = [{"text": m.get("title") or m.get("url", ""), "group": "", "selector": "", **m} for m in json.load(f)["menus"] if m.get("url")]
+        for m in menus:
+            m.setdefault("title", menu_title(m))
+        print(f"Menu diambil dari {args.menu_file}: {len(menus)} menu.")
+    else:
+        menus = ex.discover()
+        print(f"Menu terbaca: {len(menus)} menu.")
+    items = ([{"kind": "login", "title": "Login", "note": "(login akun valid & akun salah)"}]
+             + [{"kind": "menu", **m} for m in menus]
+             + [{"kind": "logout", "title": "Logout", "note": "(logout & buka halaman setelah logout)"}])
+    if interactive and not args.modules:
+        print_items(items, ex.rel)
+        while True:
+            try:
+                chosen = choose_items(items, ask("Modul yang di-UAT (nomor, rentang 2-10, nama menu, dipisah koma, atau all)", "all"))
+                break
+            except ValueError as e:
+                print(f"  {e}")
+    else:
+        try:
+            chosen = choose_items(items, args.modules)
+        except ValueError as e:
+            raise SystemExit(str(e))
+    ask_output(args, interactive)
+    tpl_defaults = builder.tpl.defaults if os.path.abspath(template) != os.path.abspath(DEFAULT_TEMPLATE) else {}
+    content = generic_content(args, tpl_defaults, ex.app, chosen, args.url, args.user)
+    out_docx, shots_dir, out_json = output_paths(args.output, content["title"])
+    os.makedirs(shots_dir, exist_ok=True)
+    ex.shots = shots_dir
+    menu_json = os.path.splitext(out_docx)[0] + "_menu.json"
+    with open(menu_json, "w", encoding="utf8") as f:
+        json.dump({"url": args.url, "app": ex.app, "home": ex.home, "dibaca": datetime.datetime.now().isoformat(timespec="seconds"),
+                   "menus": [{k: m.get(k, "") for k in ("title", "text", "group", "url", "selector")} for m in menus]},
+                  f, ensure_ascii=False, indent=1)
+    print(f"Daftar menu disimpan: {menu_json}")
+
+    def tc_fn(s, fn, it):
+        return lambda tc_id: {**ex.run(tc_id, s, fn), "module": it["title"]}
+    groups = [(it["title"], [(s, tc_fn(s, fn, it)) for s, fn in ex.plan(it)]) for it in chosen]
+    print(f"\nUAT {ex.app} · {args.url} · {len(chosen)} modul · {sum(len(g[1]) for g in groups)} test case")
+    extra = {"app": ex.app, "home": ex.home, "modules": [it["title"] for it in chosen]}
+    return content, groups, (out_docx, shots_dir, out_json), extra, None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="UAT otomatis aplikasi web → dokumen UAT (.docx)",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("-t", "--template", help="Dokumen contoh (.docx) yang formatnya diikuti. PDF/kosong = template bawaan.")
+    ap.add_argument("-u", "--url", help="URL aplikasi web, contoh https://erp.perusahaan.co.id")
+    ap.add_argument("--user", help="User/email login")
+    ap.add_argument("--password", help="Password login (kosongkan agar ditanyakan)")
+    ap.add_argument("-m", "--modules", help="Menu yang di-UAT: nomor, rentang (2-10), nama menu/grup dipisah koma, atau 'all'")
+    ap.add_argument("-o", "--output", help="Folder atau path .docx hasil")
+    ap.add_argument("--menu-file", help="Pakai daftar menu dari file *_menu.json hasil sebelumnya (bisa diedit) daripada membaca ulang")
+    ap.add_argument("--id-prefix", help="Awalan Test Case ID (bawaan UAT → UAT-001)")
+    ap.add_argument("-p", "--pack", help="Opsional: jalankan skenario dari paket di packs\\ (mis. portal-tenant) alih-alih menu otomatis")
+    ap.add_argument("--lang", choices=["en", "id"], help="[--pack] Bahasa tampilan aplikasi saat screenshot")
+    ap.add_argument("--allow-write", action="store_true", help="[--pack] Jalankan juga skenario yang mengirim/menyimpan data")
+    ap.add_argument("--account", action="append", metavar="NAMA=USER:PASSWORD", help="[--pack] Akun tambahan, mis. tr=qa.tr@yabes.co")
+    ap.add_argument("--param", action="append", metavar="KUNCI=NILAI", help="[--pack] Parameter skenario (lihat pack.json → params)")
+    ap.add_argument("--title", help="Judul dokumen (footer & properti dokumen)")
+    ap.add_argument("--project", help="Isi 'Nama Proyek'")
+    ap.add_argument("--client", help="Nama perusahaan klien pada tabel tanda tangan")
+    ap.add_argument("--module-title", help="Isi 'Modul' pada Informasi Umum")
+    ap.add_argument("--author", help="Isi 'Disusun Oleh'")
+    ap.add_argument("--reviewer", help="Isi 'Ditinjau Oleh'")
+    ap.add_argument("--doc-version", help="Isi 'Versi Dokumen'")
+    ap.add_argument("--no-run-note", action="store_true", help="Jangan tambahkan kalimat waktu/URL eksekusi di paragraf pembuka")
+    ap.add_argument("--headed", action="store_true", help="Tampilkan jendela browser (bukan headless)")
+    ap.add_argument("--browser", help="Path msedge.exe / chrome.exe")
+    ap.add_argument("--list-modules", action="store_true", help="[--pack] Tampilkan daftar modul paket lalu keluar")
+    ap.add_argument("--list-packs", action="store_true", help="Tampilkan daftar paket lalu keluar")
+    ap.add_argument("--no-interactive", action="store_true", help="Jangan bertanya; isian wajib harus lewat argumen")
+    args = ap.parse_args()
+    sys.stdout.reconfigure(encoding="utf-8")
+
+    if args.list_packs:
+        for p in list_packs():
+            with open(os.path.join(PACKS_DIR, p, "pack.json"), encoding="utf8") as f:
+                print(f"  {p:<16} {json.load(f).get('title', '')}")
+        return 0
+    interactive = not args.no_interactive and sys.stdin.isatty()
+    pack = Pack(os.path.join(PACKS_DIR, args.pack)) if args.pack else None
+    if args.list_modules:
+        if not pack:
+            raise SystemExit("Tanpa --pack, modul = menu aplikasi yang dibaca otomatis setelah login (jalankan py uat.py).")
+        print_modules(pack)
+        return 0
+
+    try:
+        browser = Browser(headless=not args.headed, browser_path=args.browser)  # cek browser sebelum mulai bertanya
+    except BrowserError as e:
+        raise SystemExit(str(e))
+
+    # Urutan isian: dokumen contoh → URL → user → password → (login & baca menu) → modul → folder simpan
+    if interactive:
+        print("Isi data UAT (Enter = pakai nilai di dalam [ ]).")
+    template, builder = get_template(args.template, interactive)
+    if interactive:
+        args.url = args.url or ask("URL web", pack.cfg.get("default_url") if pack else None)
+        args.user = args.user or ask("User")
+    args.url = normalize_url(args.url)
+    for name in ("url", "user"):
+        if not getattr(args, name):
+            raise SystemExit(f"--{name} wajib diisi.")
+    password = args.password or os.environ.get("UAT_PASSWORD")
+    while not password and sys.stdin.isatty():
+        password = getpass.getpass(f"Password {args.user} (tidak tampil di layar): ")
+    if not password:
+        raise SystemExit("--password wajib diisi (atau isi variabel lingkungan UAT_PASSWORD).")
+
     try:
         browser.start()
     except BrowserError as e:
         browser.close()
         raise SystemExit(f"Browser error: {e}")
-    results = []
     try:
-        runner = Runner(browser, pack, args.url, accounts, parse_kv(args.param), lang, args.allow_write, shots_dir)
-        prefix = pack.cfg.get("id_prefix", "UAT")
-        n = 0
-        for m in modules:
-            mod = pack.modules[m]
-            print(f"[{mod.get('title', m)}]")
-            tcs = runner.smoke_tcs(mod) if mod.get("type") == "smoke" else mod.get("testcases", [])
-            for tc_def in tcs:
-                n += 1
-                tc_id = f"{prefix}-{n:03d}"
-                tc = runner.run_tc(tc_def, tc_id)
-                tc["module"] = m
-                results.append(tc)
-                print(f"  {tc_id} {tc['status']:<8} {tc['scenario']}")
-    except BrowserError as e:
-        print(f"\nBrowser error: {e}")
-    except KeyboardInterrupt:
-        print("\nDihentikan oleh user; dokumen dibuat dari test case yang sudah selesai.")
+        try:
+            if pack:
+                content, groups, paths, extra, prefix = prepare_pack(args, pack, browser, password, builder, interactive)
+            else:
+                content, groups, paths, extra, prefix = prepare_generic(args, browser, password, template, builder, interactive)
+        except BrowserError as e:
+            raise SystemExit(f"Browser error: {e}")
+        out_docx, shots_dir, out_json = paths
+        print(f"Format dokumen: {template}\n")
+        started = time.time()
+        results = run_all(groups, args.id_prefix or prefix or "UAT")
     finally:
         browser.close()
 
     with open(out_json, "w", encoding="utf8") as f:
-        json.dump({"url": args.url, "user": args.user, "modules": modules, "lang": lang, "allow_write": args.allow_write,
+        json.dump({"url": args.url, "user": args.user, **extra,
                    "results": [{**r, "images": [list(i) for i in r["images"]]} for r in results]}, f, ensure_ascii=False, indent=1)
     builder.build(content, results, out_docx)
     counts = {}

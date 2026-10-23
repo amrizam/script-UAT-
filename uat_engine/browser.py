@@ -310,6 +310,15 @@ class Browser:
             return true;""")
         self.settle(first=0.3)
 
+    def press_enter(self, selector):
+        self._el(selector, "el.focus(); return true;")
+        for kind in ("keyDown", "keyUp"):
+            ev = {"type": kind, "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13}
+            if kind == "keyDown":
+                ev["text"] = "\r"
+            self.send("Input.dispatchKeyEvent", ev)
+        self.settle()
+
     def set_checked(self, selector, on=True):
         self._el(selector, f"if (el.checked !== {json.dumps(bool(on))}) el.click(); return true;")
         self.pump(0.15)

@@ -23,7 +23,14 @@ BROWSER_PATHS = [
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Application", "chrome.exe"),
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
 ]
+# Linux / PATH
+BROWSER_NAMES = ["microsoft-edge", "microsoft-edge-stable", "google-chrome", "google-chrome-stable", "chromium",
+                 "chromium-browser", "msedge", "chrome"]
 
 DESKTOP = dict(width=1366, height=800, deviceScaleFactor=1, mobile=False)
 MOBILE = dict(width=390, height=844, deviceScaleFactor=2, mobile=True)
@@ -42,14 +49,22 @@ def _free_port():
 
 
 def find_browser(explicit=None):
-    for p in ([explicit] if explicit else []) + BROWSER_PATHS:
+    explicit = explicit or os.environ.get("UAT_BROWSER")
+    if explicit:
+        if os.path.exists(explicit):
+            return explicit
+        raise BrowserError(f"Browser tidak ditemukan: {explicit}")
+    for p in BROWSER_PATHS + [shutil.which(n) for n in BROWSER_NAMES]:
         if p and os.path.exists(p):
             return p
-    raise BrowserError("Microsoft Edge / Google Chrome tidak ditemukan. Isi --browser dengan path msedge.exe atau chrome.exe.")
+    raise BrowserError("Microsoft Edge / Google Chrome / Chromium tidak ditemukan. "
+                       "Isi --browser dengan path msedge.exe, chrome.exe, atau chromium.")
 
 
 class Browser:
     def __init__(self, headless=True, browser_path=None, log=print):
+        if websocket is None:
+            raise BrowserError("Paket 'websocket-client' belum terpasang: py -m pip install -r requirements.txt")
         self.headless = headless
         self.exe = find_browser(browser_path)
         self.log = log
@@ -70,8 +85,6 @@ class Browser:
 
     # ── siklus hidup ────────────────────────────────────────────────────
     def start(self):
-        if websocket is None:
-            raise BrowserError("Paket 'websocket-client' belum terpasang: py -m pip install websocket-client")
         port = _free_port()
         self.profile = tempfile.mkdtemp(prefix="uat_profile_")
         args = [self.exe, f"--remote-debugging-port={port}", f"--user-data-dir={self.profile}",
@@ -80,12 +93,18 @@ class Browser:
                 "--window-size=1366,800", "about:blank"]
         if self.headless:
             args.insert(1, "--headless=new")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args.insert(1, "--no-sandbox")  # Chromium menolak jalan sebagai root (Linux/Docker) tanpa ini
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # DevTools ada di localhost: jangan lewat proxy dari HTTP(S)_PROXY
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.time() + 30
         target = None
         while time.time() < deadline and target is None:
+            if self.proc.poll() is not None:
+                raise BrowserError(f"Browser langsung tertutup (kode {self.proc.returncode}): {self.exe}")
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as r:
+                with opener.open(f"http://127.0.0.1:{port}/json/list", timeout=2) as r:
                     pages = [t for t in json.load(r) if t.get("type") == "page"]
                 target = pages[0] if pages else None
             except Exception:

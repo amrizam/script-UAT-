@@ -2,9 +2,9 @@
 """UAT otomatis aplikasi web → dokumen UAT (.docx) mengikuti format dokumen contoh.
 
 Contoh:
+  py uat.py            (tanpa argumen: dokumen contoh, URL, user, password, modul, dan folder simpan ditanyakan satu per satu)
   py uat.py --template "D:\\UAT\\UAT_Portal_Tenant.docx" --url https://lymanportal.vcloudproperty.com ^
-            --user qa.tenant.lyman@yabes.co --modules login,request,billing --output "D:\\UAT\\Hasil"
-  py uat.py            (tanpa argumen: semua isian ditanyakan satu per satu)
+            --user qa.tenant.lyman@yabes.co --modules login,home,request --output "D:\\UAT\\Hasil"
   py uat.py --list-modules
 Password tidak perlu ditulis di perintah: bila --password kosong akan ditanyakan (tidak tampil di layar).
 """
@@ -48,6 +48,58 @@ def ask(prompt, default=None, required=True):
         print("  Wajib diisi.")
 
 
+def ask_yes(prompt, default=False):
+    val = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    return default if not val else val in ("y", "ya", "yes")
+
+
+def clean_path(p):
+    """Path hasil drag & drop ke terminal: "C:\\a b.docx", 'C:\\a b.docx', atau & 'C:\\a b.docx' (PowerShell)."""
+    p = (p or "").strip()
+    if p.startswith("& "):
+        p = p[2:].strip()
+    return os.path.expanduser(p.strip("\"'"))
+
+
+def normalize_url(url):
+    url = (url or "").strip().rstrip("/")
+    return url if not url or "://" in url else "https://" + url
+
+
+def open_template(path):
+    """DocBuilder dari dokumen contoh; .pdf/kosong → template bawaan."""
+    if not path or not path.lower().endswith(".docx"):
+        if path:
+            print(f"Catatan: '{path}' bukan file .docx; format diambil dari template bawaan.")
+        path = DEFAULT_TEMPLATE
+    if not os.path.exists(path):
+        raise ValueError(f"File tidak ditemukan: {path}")
+    try:
+        return path, DocBuilder(path)
+    except Exception as e:
+        raise ValueError(f"'{path}' tidak dapat dibaca sebagai dokumen Word: {e}")
+
+
+def ask_template():
+    while True:
+        p = clean_path(ask("Dokumen contoh (.docx, Enter = template bawaan)", required=False))
+        try:
+            return open_template(p)
+        except ValueError as e:
+            print(f"  {e}")
+
+
+def get_template(arg, interactive):
+    if arg:
+        try:
+            return open_template(clean_path(arg))
+        except ValueError as e:
+            if not interactive:
+                raise SystemExit(str(e))
+            print(f"  {e}")
+    return ask_template() if interactive else open_template("")
+
+
 def parse_kv(items, sep="="):
     out = {}
     for it in items or []:
@@ -81,8 +133,11 @@ def choose_modules(pack, raw):
             continue
         if token.isdigit() and 1 <= int(token) <= len(names):
             token = names[int(token) - 1]
+        if token in pack.cfg.get("modules", []) and token not in pack.modules:
+            raise ValueError(f"Modul '{token}' belum punya skenario ({os.path.join('modules', token + '.json')} belum dibuat). "
+                             f"Pilihan: {', '.join(names)}")
         if token not in pack.modules:
-            raise SystemExit(f"Modul '{token}' tidak ada di paket {os.path.basename(pack.dir)}. Pilihan: {', '.join(names)}")
+            raise ValueError(f"Modul '{token}' tidak ada di paket {os.path.basename(pack.dir)}. Pilihan: {', '.join(names)}")
         if token not in picked:
             picked.append(token)
     return picked
@@ -94,6 +149,9 @@ def print_modules(pack):
         m = pack.modules[name]
         n = len(m.get("testcases", [])) if m.get("type") != "smoke" else "per halaman"
         print(f"  {i:>2}. {name:<10} {m.get('title', ''):<28} ({n} test case)")
+    todo = [m for m in pack.cfg.get("modules", []) if m not in pack.modules]
+    if todo:
+        print(f"      belum ada skenario: {', '.join(todo)}")
 
 
 def output_paths(output, title):
@@ -103,6 +161,10 @@ def output_paths(output, title):
     else:
         safe = re.sub(r'[\\/:*?"<>|]+', "", title).strip() or "UAT"
         out = os.path.join(os.path.abspath(output), f"{safe} {stamp}.docx")
+        k = 2
+        while os.path.exists(out):  # jangan timpa hasil sebelumnya (bisa sedang dibuka di Word)
+            out = os.path.join(os.path.abspath(output), f"{safe} {stamp} ({k}).docx")
+            k += 1
     os.makedirs(os.path.dirname(out), exist_ok=True)
     stem = os.path.splitext(out)[0]
     return out, stem + "_screenshots", stem + "_hasil.json"
@@ -209,28 +271,51 @@ def main():
         print_modules(pack)
         return 0
 
+    try:
+        browser = Browser(headless=not args.headed, browser_path=args.browser)  # cek browser sebelum mulai bertanya
+    except BrowserError as e:
+        raise SystemExit(str(e))
+
+    # Urutan isian: dokumen contoh → URL → user → password → modul → folder simpan
     if interactive:
-        args.template = args.template or ask("Dokumen contoh (.docx/.pdf, Enter = template bawaan)", required=False)
+        print("Isi data UAT (Enter = pakai nilai di dalam [ ]).")
+    template, builder = get_template(args.template, interactive)
+    if interactive:
         args.url = args.url or ask("URL web", pack.cfg.get("default_url"))
         args.user = args.user or ask("User")
-        if not args.modules:
-            print_modules(pack)
-            args.modules = ask("Modul yang di-UAT (nomor/nama dipisah koma, atau all)", "all")
-        args.output = args.output or ask("Simpan dokumen di (folder atau .docx)", os.path.join(os.path.expanduser("~"), "Documents", "UAT"))
-    for name in ("url", "user", "output"):
+    args.url = normalize_url(args.url)
+    for name in ("url", "user"):
         if not getattr(args, name):
             raise SystemExit(f"--{name} wajib diisi.")
-    password = args.password or os.environ.get("UAT_PASSWORD") or getpass.getpass(f"Password {args.user}: ")
+    password = args.password or os.environ.get("UAT_PASSWORD")
+    while not password and sys.stdin.isatty():
+        password = getpass.getpass(f"Password {args.user} (tidak tampil di layar): ")
+    if not password:
+        raise SystemExit("--password wajib diisi (atau isi variabel lingkungan UAT_PASSWORD).")
+    if interactive and not args.modules:
+        print_modules(pack)
+        while True:
+            try:
+                modules = choose_modules(pack, ask("Modul yang di-UAT (nomor/nama dipisah koma, atau all)", "all"))
+                break
+            except ValueError as e:
+                print(f"  {e}")
+    else:
+        try:
+            modules = choose_modules(pack, args.modules)
+        except ValueError as e:
+            raise SystemExit(str(e))
+    if interactive:
+        args.output = args.output or ask("Simpan dokumen di (folder atau path .docx)", os.path.join(os.path.expanduser("~"), "Documents", "UAT"))
+    if not args.output:
+        raise SystemExit("--output wajib diisi.")
+    args.output = clean_path(args.output)
+    n_write = sum(1 for m in modules for tc in pack.modules[m].get("testcases", []) if tc.get("write"))
+    if interactive and n_write and not args.allow_write:
+        args.allow_write = ask_yes(f"{n_write} skenario akan mengirim/menyimpan data ke aplikasi (mis. membuat request, ganti password). "
+                                   "Jalankan juga?")
     lang = args.lang or pack.cfg.get("default_lang", "en")
     args.lang = lang
-    modules = choose_modules(pack, args.modules)
-
-    template = args.template.strip('"') if args.template else ""
-    if not template or not template.lower().endswith(".docx") or not os.path.exists(template):
-        if template:
-            print(f"Catatan: '{template}' bukan file .docx yang ada; format diambil dari template bawaan.")
-        template = DEFAULT_TEMPLATE
-    builder = DocBuilder(template)
 
     accounts = {"main": {"user": args.user, "password": password}}
     accounts.update(parse_accounts(args.account))
@@ -241,10 +326,13 @@ def main():
           f" · {'mode tulis AKTIF' if args.allow_write else 'mode baca (tanpa kirim data)'}")
     print(f"Format dokumen: {template}\n")
     started = time.time()
-    browser = Browser(headless=not args.headed, browser_path=args.browser)
-    results = []
     try:
         browser.start()
+    except BrowserError as e:
+        browser.close()
+        raise SystemExit(f"Browser error: {e}")
+    results = []
+    try:
         runner = Runner(browser, pack, args.url, accounts, parse_kv(args.param), lang, args.allow_write, shots_dir)
         prefix = pack.cfg.get("id_prefix", "UAT")
         n = 0
@@ -282,4 +370,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, EOFError):
+        print("\nDibatalkan.")
+        sys.exit(1)

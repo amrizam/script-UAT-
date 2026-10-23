@@ -1,0 +1,59 @@
+{
+  "name": "portal-tenant",
+  "title": "Portal Tenant",
+  "id_prefix": "UAT-PT",
+  "default_lang": "en",
+  "default_url": "https://lymanportal.vcloudproperty.com",
+  "modules": ["login", "home", "request", "billing", "overtime", "booking", "akses"],
+  "max_posts_per_minute": 18,
+  "messages_selector": ".alert, .field-error, .field-validation-error, .validation-summary-errors li, .info-box, .bd-hint, #photo-note, .empty h3, .empty p, .auth-done h1, .auth-done p, .error-page h1, main h1",
+  "login": {
+    "path": "/Account/Login",
+    "user": "#Email",
+    "password": "#Password",
+    "submit": "form[action*='/Account/Login'] button[type=submit]",
+    "fail_url": "/Account/Login"
+  },
+  "logout": [
+    {"click": ".hdr-user summary", "settle": false},
+    {"click": ".hdr-user form[action*='Logout'] button[type=submit]"}
+  ],
+  "language": {
+    "en": [{"goto": "/Language/Set?culture=en-US&returnUrl=%2FAccount%2FLogin"}, {"eval": "try { localStorage.setItem('lp-lang', 'en') } catch (e) { } true"}],
+    "id": [{"goto": "/Language/Set?culture=id-ID&returnUrl=%2FAccount%2FLogin"}, {"eval": "try { localStorage.setItem('lp-lang', 'id') } catch (e) { } true"}]
+  },
+  "params": {
+    "lockout_email": "uat.lockout.{stamp}@example.com",
+    "unknown_email": "uat.tidak.terdaftar.{stamp}@example.com",
+    "new_password": "Uat#Portal{stamp}",
+    "request_phone": "081200000001",
+    "request_text": "MCB di panel listrik unit sering trip saat AC dinyalakan, lokasi panel di dekat pantry. (UAT)",
+    "billing_as": "main",
+    "billing_from": "{date:-90}",
+    "billing_to": "{date:+0}",
+    "receipts_from": "{date:-365}",
+    "receipts_to": "{date:+0}",
+    "booking_date": "{date:+10}",
+    "overtime_date": "{date:+7}",
+    "overtime_start": "18:00",
+    "overtime_end": "21:00"
+  },
+  "defaults": {
+    "doc_title": "UAT Portal Tenant",
+    "project": "PT. Swadharma Primautama",
+    "intro": ["Dokumen User Acceptance Test (UAT) ini digunakan sebagai acuan pengujian aplikasi Portal Tenant oleh pengguna akhir untuk memastikan bahwa fungsi aplikasi telah berjalan sesuai kebutuhan bisnis sebelum go-live."],
+    "tujuan": ["Tujuan dari UAT adalah memastikan bahwa Portal Tenant telah memenuhi kebutuhan proses bisnis tenant dan pengelola gedung, alur pengajuan dan konfirmasi berjalan dengan benar, data tersimpan dan tersinkron secara akurat dengan sistem gedung, serta output sistem (status, jadwal, dan invoice) sesuai dengan aturan dan ekspektasi operasional perusahaan."],
+    "kriteria": [
+      "Seluruh skenario pengujian kritikal berhasil dijalankan",
+      "Tidak terdapat defect dengan kategori blocker atau critical",
+      "Alur konfirmasi oleh Tenant Relation, departemen terkait, dan Finance berjalan sesuai kebutuhan bisnis",
+      "Data yang diinput, diproses, dan ditampilkan akurat, sesuai sistem gedung, dan hanya dapat diakses oleh tenant pemilik unit",
+      "Data master pendukung (kategori request, jenis overtime dan zona, meeting room dan package, tarif) tersedia sehingga skenario pengajuan dapat dijalankan end-to-end",
+      "Pengguna memberikan persetujuan bahwa sistem siap digunakan"
+    ],
+    "signers": [
+      {"company": "PT. Yabes Multipro Solusindo", "roles": ["Project Manager", "Consultant"]},
+      {"company": "PT. Swadharma Primautama", "roles": ["Project Manager", "Key User", "Key User", "Key User"]}
+    ]
+  }
+}
